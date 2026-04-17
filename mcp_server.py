@@ -14,17 +14,22 @@ SQL tools use SQLite databases in the allowed filesystem paths.
 Trade journal tools persist to a SQLite DB at ./trade_journal.db (configurable).
 """
 
+import ast
 import base64
 import csv
 import hashlib
 import inspect
 import io
+import ipaddress
 import json
 import math
+import operator as _operator
 import os
 import random
 import re
+import secrets as _secrets
 import shutil
+import socket
 import sqlite3
 import string
 import uuid
@@ -248,6 +253,125 @@ def _path_under(child: str, parent: str) -> bool:
     return c == p or c.startswith(p.rstrip(os.sep) + os.sep)
 
 
+# ---------------------------------------------------------------------------
+# SSRF guard (H-2) — block loopback / link-local / private / reserved targets
+# unless the operator explicitly opts in with MCP_ALLOW_LOCAL_HTTP=1.
+# ---------------------------------------------------------------------------
+
+def _ssrf_allowed_local() -> bool:
+    raw = os.getenv("MCP_ALLOW_LOCAL_HTTP", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _ssrf_check_url(url: str) -> tuple[bool, str]:
+    """Return (ok, reason). Reject non-http(s) schemes and private-network hosts
+    unless MCP_ALLOW_LOCAL_HTTP=1. Used by http_request / web_fetch / etc."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        return False, f"invalid URL: {exc}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, f"scheme '{scheme}' is not allowed; only http/https"
+    host = parsed.hostname or ""
+    if not host:
+        return False, "URL has no host"
+    if _ssrf_allowed_local():
+        return True, ""
+    # Resolve all addresses and reject if any is disallowed.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:
+        return False, f"hostname resolution failed: {exc}"
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False, (
+                f"host '{host}' resolves to '{ip}' which is loopback/private/"
+                "reserved; set MCP_ALLOW_LOCAL_HTTP=1 to allow"
+            )
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Safe math expression evaluator (H-3) — replaces eval() in calculator.
+# Uses the AST to permit only numeric literals, +, -, *, /, //, %, **, unary
+# +/-, function calls to an approved whitelist, and attribute-less name
+# lookups into that whitelist. Rejects dunder access and any node type not
+# in the allowlist below.
+# ---------------------------------------------------------------------------
+
+_SAFE_BIN_OPS = {
+    ast.Add: _operator.add,
+    ast.Sub: _operator.sub,
+    ast.Mult: _operator.mul,
+    ast.Div: _operator.truediv,
+    ast.FloorDiv: _operator.floordiv,
+    ast.Mod: _operator.mod,
+    ast.Pow: _operator.pow,
+}
+_SAFE_UNARY_OPS = {ast.UAdd: _operator.pos, ast.USub: _operator.neg}
+
+
+def _safe_math_eval(expression: str, allowed: dict[str, Any]) -> Any:
+    if "_" in expression:
+        raise ValueError("underscores are not allowed in expressions")
+    if len(expression) > 200:
+        raise ValueError("expression is too long")
+    tree = ast.parse(expression, mode="eval")
+
+    def _eval(node: ast.AST) -> Any:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("only numeric constants are allowed")
+        if isinstance(node, ast.Num):  # py<3.8 fallback
+            return node.n
+        if isinstance(node, ast.BinOp):
+            op = _SAFE_BIN_OPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"operator {type(node.op).__name__} not allowed")
+            return op(_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            op = _SAFE_UNARY_OPS.get(type(node.op))
+            if op is None:
+                raise ValueError(f"operator {type(node.op).__name__} not allowed")
+            return op(_eval(node.operand))
+        if isinstance(node, ast.Name):
+            if node.id not in allowed:
+                raise ValueError(f"name '{node.id}' is not allowed")
+            return allowed[node.id]
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("only direct function calls are allowed")
+            if node.func.id not in allowed:
+                raise ValueError(f"function '{node.func.id}' is not allowed")
+            func = allowed[node.func.id]
+            if not callable(func):
+                raise ValueError(f"'{node.func.id}' is not callable")
+            if node.keywords:
+                raise ValueError("keyword arguments are not allowed")
+            args = [_eval(a) for a in node.args]
+            return func(*args)
+        if isinstance(node, ast.Tuple):
+            return tuple(_eval(e) for e in node.elts)
+        raise ValueError(f"syntax element {type(node).__name__} not allowed")
+
+    return _eval(tree)
+
+
 def _check_fs_access(requested_path: str, settings: dict | None = None) -> tuple[bool, str]:
     """Return (allowed, resolved_path_or_error_message)."""
     settings = settings or _load_fs_settings()
@@ -271,9 +395,17 @@ def _check_fs_access(requested_path: str, settings: dict | None = None) -> tuple
 
 
 def _resolve_db_path(db_path: str) -> tuple[bool, str]:
+    # SECURITY FIX [M-8]: Reject paths whose extension is not already a
+    # SQLite one. Previously the function silently appended ".db", which
+    # meant an LLM-supplied "./report.txt" became "./report.txt.db" and
+    # was created as a database. Require a proper extension up-front so
+    # callers cannot clobber or create files with surprising names.
     p = Path(db_path)
-    if p.suffix not in (".db", ".sqlite", ".sqlite3"):
-        db_path = db_path + ".db"
+    if p.suffix.lower() not in (".db", ".sqlite", ".sqlite3"):
+        return False, (
+            f"Database path must end in .db, .sqlite, or .sqlite3 "
+            f"(got '{p.suffix or '<none>'}')."
+        )
     return _check_fs_access(db_path)
 
 
@@ -401,10 +533,16 @@ def calculator(params: CalculatorInput) -> str:
     Returns:
         JSON with keys: expression, result (or error).
     """
+    # SECURITY FIX [H-3]: The previous implementation used eval() with
+    # {"__builtins__": {}}, which is not a sandbox — dunder traversal on
+    # literals (e.g., `().__class__.__bases__[0].__subclasses__()`) can
+    # still recover arbitrary objects. We now parse the expression with
+    # ast.parse(mode="eval") and only permit numeric literals, arithmetic
+    # operators, and calls into an explicit whitelist built from math.*.
     allowed = {k: v for k, v in math.__dict__.items() if not k.startswith("_")}
     allowed.update({"abs": abs, "round": round, "min": min, "max": max, "sum": sum})
     try:
-        result = eval(params.expression, {"__builtins__": {}}, allowed)  # noqa: S307
+        result = _safe_math_eval(params.expression, allowed)
         return json.dumps({"expression": params.expression, "result": result})
     except Exception as exc:
         return json.dumps({"error": str(exc), "expression": params.expression})
@@ -886,11 +1024,13 @@ def random_data(params: RandomDataInput) -> str:
         elif t == "choice":
             results.append(random.choice(opts))
         elif t == "password":
+            # SECURITY FIX [L-3]: Use secrets.choice for password
+            # generation; the previous random.choice is not suitable for
+            # security-sensitive output.
             alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-            results.append("".join(random.choice(alphabet) for _ in range(params.length)))
+            results.append("".join(_secrets.choice(alphabet) for _ in range(params.length)))
         elif t == "hex_token":
-            import secrets
-            results.append(secrets.token_hex(params.length // 2))
+            results.append(_secrets.token_hex(params.length // 2))
     return json.dumps({"type": params.type, "values": results,
                        "count": len(results), "first": results[0]})
 
@@ -1726,8 +1866,16 @@ def web_fetch(
         JSON with keys: url, status, content_type, content, truncated.
     """
     try:
+        # SECURITY FIX [H-2]: SSRF guard.
+        ok, reason = _ssrf_check_url(url)
+        if not ok:
+            return _err(f"blocked by SSRF guard: {reason}", url=url)
         import httpx
         resp = httpx.get(url, headers=_http_headers(), timeout=15, follow_redirects=True)
+        if str(resp.url) != url:
+            ok2, reason2 = _ssrf_check_url(str(resp.url))
+            if not ok2:
+                return _err(f"redirect blocked by SSRF guard: {reason2}", url=str(resp.url))
         resp.raise_for_status()
         content = resp.text[:max_chars]
         return json.dumps({
@@ -1756,8 +1904,16 @@ def extract_text(
         JSON with keys: url, text, truncated, word_count.
     """
     try:
+        # SECURITY FIX [H-2]: SSRF guard.
+        ok, reason = _ssrf_check_url(url)
+        if not ok:
+            return _err(f"blocked by SSRF guard: {reason}", url=url)
         import httpx
         resp = httpx.get(url, headers=_http_headers(), timeout=15, follow_redirects=True)
+        if str(resp.url) != url:
+            ok2, reason2 = _ssrf_check_url(str(resp.url))
+            if not ok2:
+                return _err(f"redirect blocked by SSRF guard: {reason2}", url=str(resp.url))
         resp.raise_for_status()
         html = resp.text
         html = re.sub(r'<(script|style|noscript|head)[^>]*>[\s\S]*?</\1>', '', html, flags=re.IGNORECASE)
@@ -1811,15 +1967,36 @@ def http_request(params: HttpRequestInput) -> str:
         JSON with keys: status, headers, body, truncated.
     """
     try:
+        # SECURITY FIX [H-2]: Reject loopback / private / link-local / reserved
+        # targets unless MCP_ALLOW_LOCAL_HTTP=1. Blocks SSRF pivots into
+        # 169.254.169.254 cloud metadata, 127.0.0.1 services, LAN hosts, etc.
+        ok, reason = _ssrf_check_url(params.url)
+        if not ok:
+            return _err(f"blocked by SSRF guard: {reason}", url=params.url)
         import httpx
         extra_headers = json.loads(params.headers_json) if params.headers_json else {}
         hdrs = {**_http_headers(), **extra_headers}
         # params.method is already uppercased and validated by the Pydantic validator.
-        with httpx.Client(timeout=params.timeout, follow_redirects=True) as client:
+        with httpx.Client(timeout=params.timeout, follow_redirects=False) as client:
             if params.method in ("POST", "PUT", "PATCH"):
                 resp = client.request(params.method, params.url, content=params.body, headers=hdrs)
             else:
                 resp = client.request(params.method, params.url, headers=hdrs)
+        # Manually follow redirects with an SSRF check on each hop.
+        hops = 0
+        while resp.is_redirect and hops < 5:
+            next_url = str(resp.headers.get("location", ""))
+            if not next_url:
+                break
+            next_url = str(resp.url.join(next_url))
+            ok, reason = _ssrf_check_url(next_url)
+            if not ok:
+                return _err(
+                    f"redirect blocked by SSRF guard: {reason}", url=next_url
+                )
+            hops += 1
+            with httpx.Client(timeout=params.timeout, follow_redirects=False) as client:
+                resp = client.request("GET", next_url, headers=hdrs)
         return json.dumps({
             "status": resp.status_code,
             "headers": dict(resp.headers.items()),
@@ -1843,15 +2020,24 @@ def url_info(url: Annotated[str, "URL to inspect"]) -> str:
         JSON with keys: url, final_url, status, content_type, content_length, server, redirected.
     """
     try:
+        # SECURITY FIX [H-2]: SSRF guard.
+        ok, reason = _ssrf_check_url(url)
+        if not ok:
+            return _err(f"blocked by SSRF guard: {reason}", url=url)
         import httpx
         resp = httpx.get(url, headers=_http_headers(), timeout=10, follow_redirects=True)
+        final_url = str(resp.url)
+        if final_url != url:
+            ok2, reason2 = _ssrf_check_url(final_url)
+            if not ok2:
+                return _err(f"redirect blocked by SSRF guard: {reason2}", url=final_url)
         return json.dumps({
-            "url": url, "final_url": str(resp.url),
+            "url": url, "final_url": final_url,
             "status": resp.status_code,
             "content_type": resp.headers.get("content-type", ""),
             "content_length": resp.headers.get("content-length", "unknown"),
             "server": resp.headers.get("server", "unknown"),
-            "redirected": str(resp.url) != url,
+            "redirected": final_url != url,
         })
     except Exception as exc:
         return _err(str(exc), url=url)
@@ -2944,7 +3130,13 @@ def _env_opt(name: str) -> str | None:
     return value or None
 
 
-_DEFAULT_BROWSER_ORIGINS = (
+# SECURITY FIX [H-1]: The previous implementation hard-coded
+# http://localhost:{7860,3000} into the CORS allowlist even when the
+# operator set MCP_ALLOWED_ORIGINS. That let any local page on those
+# ports drive the full MCP tool surface. We now only include the loopback
+# defaults when MCP_ALLOWED_ORIGINS is entirely unset, so an explicit
+# setting is always honoured exactly.
+_LOOPBACK_BROWSER_ORIGINS = (
     "http://localhost:7860",
     "http://127.0.0.1:7860",
     "http://localhost:3000",
@@ -2968,23 +3160,52 @@ def _parse_allowed_origins(raw: str) -> list[str]:
 
 
 def _browser_allowed_origins() -> list[str]:
-    configured = _parse_allowed_origins(os.getenv("MCP_ALLOWED_ORIGINS", ""))
+    raw = os.getenv("MCP_ALLOWED_ORIGINS", "")
+    configured = _parse_allowed_origins(raw)
+    # SECURITY FIX [H-1]: Refuse to start with a wildcard origin. Wildcards
+    # would let any public site on the internet drive every MCP tool.
     if configured == ["*"]:
+        raise RuntimeError(
+            "MCP_ALLOWED_ORIGINS='*' is unsafe. Set explicit origins "
+            "(e.g. 'https://hivebyte.net'); refusing to start."
+        )
+    if configured:
         return configured
-    combined = list(_DEFAULT_BROWSER_ORIGINS)
-    combined.extend(configured)
-    return _parse_allowed_origins(",".join(combined))
+    # No explicit configuration: fall back to the loopback defaults so
+    # local-only development still works.
+    return list(_LOOPBACK_BROWSER_ORIGINS)
 
 
 class BrowserAccessHeadersMiddleware:
-    """Add headers browsers may require for public-origin -> local-service access."""
+    """Add headers browsers may require for public-origin -> local-service access.
 
-    def __init__(self, app):
+    SECURITY FIX [H-1 / M-1]: The previous implementation sent
+    ``Access-Control-Allow-Private-Network: true`` unconditionally, which
+    lowered Chrome's Private Network Access protection for *every*
+    request, including ones from origins we never intended to trust. We
+    now emit the header only when the request's Origin is in the
+    allowlist, so PNA enforcement remains for everyone else.
+    """
+
+    def __init__(self, app, allowed_origins: tuple[str, ...] = ()):
         self.app = app
+        self.allowed = {o.rstrip("/").lower() for o in allowed_origins}
 
     async def __call__(self, scope, receive, send):
+        request_origin = ""
+        if scope.get("type") == "http":
+            for name, value in scope.get("headers", []):
+                if name == b"origin":
+                    try:
+                        request_origin = value.decode("latin-1").rstrip("/").lower()
+                    except Exception:
+                        request_origin = ""
+                    break
+
+        allow_pna = request_origin != "" and request_origin in self.allowed
+
         async def send_wrapper(message):
-            if message["type"] == "http.response.start":
+            if message["type"] == "http.response.start" and allow_pna:
                 headers = MutableHeaders(raw=message["headers"])
                 headers["Access-Control-Allow-Private-Network"] = "true"
             await send(message)
@@ -2994,15 +3215,28 @@ class BrowserAccessHeadersMiddleware:
 
 def _build_http_middleware() -> list[Middleware]:
     allowed_origins = _browser_allowed_origins()
-    middleware: list[Middleware] = [Middleware(BrowserAccessHeadersMiddleware)]
+    middleware: list[Middleware] = [
+        Middleware(
+            BrowserAccessHeadersMiddleware,
+            allowed_origins=tuple(allowed_origins),
+        )
+    ]
     if allowed_origins:
         middleware.append(
             Middleware(
                 CORSMiddleware,
                 allow_origins=allowed_origins,
                 allow_credentials=False,
-                allow_methods=["*"],
-                allow_headers=["*"],
+                # SECURITY FIX [M-1]: Tighten from "*" to the exact set of
+                # methods/headers the MCP protocol actually needs.
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=[
+                    "content-type",
+                    "accept",
+                    "authorization",
+                    "mcp-session-id",
+                    "x-requested-with",
+                ],
                 expose_headers=["Mcp-Session-Id"],
                 max_age=600,
             )
@@ -3012,7 +3246,11 @@ def _build_http_middleware() -> list[Middleware]:
 if __name__ == "__main__":
     runtime_settings = load_settings_snapshot()
     port = int(os.getenv("MCP_PORT", str(runtime_settings.get("mcp_port", 9000))))
-    host = os.getenv("MCP_HOST", str(runtime_settings.get("mcp_host", "0.0.0.0")))
+    # SECURITY FIX [L-1]: Default the MCP bind host to loopback. The
+    # browser-side code in hosted mode talks to the server from
+    # 127.0.0.1/localhost, so this doesn't regress the hosted UX while
+    # removing "bound to 0.0.0.0 by default" as an attack surface.
+    host = os.getenv("MCP_HOST", str(runtime_settings.get("mcp_host", "127.0.0.1")))
     ssl_certfile = _env_opt("MCP_SSL_CERTFILE")
     ssl_keyfile = _env_opt("MCP_SSL_KEYFILE")
     ssl_keyfile_password = _env_opt("MCP_SSL_KEYFILE_PASSWORD")
